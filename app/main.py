@@ -1,3 +1,7 @@
+import sys
+import time
+from pathlib import Path
+import asyncio
 import os
 import re
 import hashlib
@@ -491,7 +495,6 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text
 
     if text in ("📰 Сегодня", "Сегодня"):
-        # авто-sync
         context.args = []
         await cmd_news(update, context)
         return
@@ -516,6 +519,56 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Настройки появятся позже.")
         return
 
+async def list_all_subscriptions() -> list[tuple[int, int, str, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id, id, url, title FROM subscriptions ORDER BY user_id, id"
+        )
+        rows = await cur.fetchall()
+        return [(int(r[0]), int(r[1]), str(r[2]), str(r[3])) for r in rows]
+
+
+async def run_sync_cli() -> None:
+    start_ts = time.time()
+    log_dir = Path("/opt/rss_digest_bot/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "sync.log"
+
+    def log_line(msg: str) -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+
+    # гарантируем, что БД/таблицы есть
+    await init_db()
+
+    subs = await list_all_subscriptions()
+    users_count = len({u for (u, _sid, _url, _t) in subs})
+    log_line(f"start users={users_count} feeds={len(subs)}")
+    if not subs:
+        print("No subscriptions to sync.")
+        return
+
+    total_added = 0
+    failed = 0
+
+    timeout = httpx.Timeout(20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        for user_id, sub_id, url, _title in subs:
+            try:
+                r = await client.get(url, headers={"User-Agent": "rss-digest-bot/0.1"})
+                r.raise_for_status()
+                parsed = feedparser.parse(r.content)
+                if not getattr(parsed, "feed", None) or parsed.entries is None:
+                    failed += 1
+                    continue
+                total_added += await save_entries(user_id, sub_id, url, parsed)
+            except Exception:
+                failed += 1
+    duration = time.time() - start_ts
+    log_line(f"done new_entries={total_added} errors={failed} duration_sec={duration:.2f}")
+    print(f"Sync done. New entries: {total_added}. Errors: {failed}.")
+
 def main() -> None:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -539,4 +592,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "sync":
+        asyncio.run(run_sync_cli())
+    else:
+        main()
