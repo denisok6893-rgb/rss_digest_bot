@@ -541,11 +541,19 @@ async def run_sync_cli() -> None:
 
     # гарантируем, что БД/таблицы есть
     await init_db()
-
+    total_added = 0
+    failed = 0
     subs = await list_all_subscriptions()
     users_count = len({u for (u, _sid, _url, _t) in subs})
     log_line(f"start users={users_count} feeds={len(subs)}")
+    # если были ошибки — сигналим systemd, что запуск проблемный
+    if failed > 0:
+        print(f"Sync finished with errors: {failed}")
+        raise SystemExit(1)
+
     if not subs:
+        print("No subscriptions to sync.")
+        # нет подписок — это не ошибка, завершаемся успешно
         print("No subscriptions to sync.")
         return
 
