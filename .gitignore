@@ -4,3 +4,7 @@ __pycache__/
 data/
 .env
 .DS_Store
+
+# local db
+rss.db
+data/*.db

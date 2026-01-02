@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Tuple
 from telegram.request import HTTPXRequest
+from openai import AsyncOpenAI
 
 import aiosqlite
 import feedparser
@@ -12,7 +13,8 @@ import httpx
 from dotenv import load_dotenv
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from app.keyboards.main_menu import main_menu_keyboard
 
 load_dotenv()
 
@@ -117,6 +119,48 @@ def clean_html(text: str) -> str:
     text = text.replace("&nbsp;", " ")
     text = text.replace("&amp;", "&")
     return " ".join(text.split())
+
+def _get_deepseek_client() -> AsyncOpenAI:
+    key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").strip()
+    if not key:
+        raise RuntimeError("DEEPSEEK_API_KEY not set")
+    return AsyncOpenAI(api_key=key, base_url=base_url)
+
+async def make_digest(items: list[tuple[str, str, str]], period_label: str) -> str:
+    # items: (title, summary, link)
+    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat"
+
+    lines = []
+    for i, (title, summary, link) in enumerate(items, 1):
+        s = clean_html(summary or "")
+        s = (s[:300] + "…") if len(s) > 300 else s
+        lines.append(f"{i}. {title}\n{s}\n{link}")
+    source_block = "\n\n".join(lines)
+
+    system = (
+        "Ты помощник, который делает краткую сводку новостей строго по предоставленным пунктам. "
+        "Нельзя добавлять факты, которых нет в тексте. Если данных мало — так и скажи."
+    )
+    user = (
+        f"Сделай сводку за период: {period_label}.\n"
+        "Формат:\n"
+        "1) 4–7 буллетов: ключевые события/темы (без выдумок)\n"
+        "2) 'Ключевые ссылки' — 3–5 ссылок из списка (без новых)\n\n"
+        f"Данные:\n{source_block}"
+    )
+
+    client = _get_deepseek_client()
+    resp = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+        max_tokens=800,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 async def save_entries(user_id: int, subscription_id: int, feed_url: str, parsed) -> int:
     added = 0
@@ -282,14 +326,11 @@ async def delete_subscription(user_id: int, sub_id: int) -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "RSS Digest Bot\n\n"
-        "Команды:\n"
-        "/add <rss_url> — добавить канал\n"
-        "/list — список каналов\n"
-        "/del <id> — удалить канал\n"
-        "/sync — скачать новые новости из всех каналов\n"
-        "/news — новости за сегодня"
+        "Я собираю новости из RSS и помогаю быстро их просматривать.\n"
+        "Добавь источники и смотри сводки 👇",
+        reply_markup=main_menu_keyboard(),
     )
+
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -362,6 +403,28 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(f"Синхронизация готова.\nНовых записей: {total_added}\nОшибок: {failed}")
 
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    rows = await get_today_news(user_id, limit=10)  # (title, link, summary, published_at)
+    if not rows:
+        await update.message.reply_text("Нет новостей за сегодня. Сначала /sync или подожди авто-sync.")
+        return
+
+    items = [(r[0], r[2], r[1]) for r in rows]  # title, summary, link
+    text = await make_digest(items, period_label="сегодня")
+    await update.message.reply_text(text[:4000])
+
+async def cmd_digest_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    rows = await get_week_news(user_id, limit=15)
+    if not rows:
+        await update.message.reply_text("Нет новостей за неделю. Сначала /sync или подожди авто-sync.")
+        return
+
+    items = [(r[0], r[2], r[1]) for r in rows]
+    text = await make_digest(items, period_label="неделя")
+    await update.message.reply_text(text[:4000])
+
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
 
@@ -422,6 +485,43 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(app: Application) -> None:
     await init_db()
 
+async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text
+
+    if text in ("📰 Сегодня", "Сегодня"):
+        # авто-sync
+        context.args = []
+        await cmd_sync(update, context)
+
+        # новости за сегодня
+        context.args = []
+        await cmd_news(update, context)
+        return
+
+    if text in ("📅 Неделя", "Неделя"):
+        # авто-sync
+        context.args = []
+        await cmd_sync(update, context)
+
+        # новости за неделю
+        context.args = ["week"]
+        await cmd_news(update, context)
+        return
+
+    if text in ("📃 Мои источники", "Мои источники"):
+        context.args = []
+        await cmd_list(update, context)
+        return
+
+    if text in ("➕ Добавить RSS", "Добавить RSS"):
+        await update.message.reply_text(
+            "Пришли ссылку на RSS в формате:\n/add https://example.com/rss"
+        )
+        return
+
+    if text in ("⚙️ Настройки", "Настройки"):
+        await update.message.reply_text("Настройки появятся позже.")
+        return
 
 def main() -> None:
     token = os.getenv("BOT_TOKEN", "").strip()
@@ -436,8 +536,12 @@ def main() -> None:
     app.add_handler(CommandHandler("del", cmd_del))
     app.add_handler(CommandHandler("sync", cmd_sync))
     app.add_handler(CommandHandler("news", cmd_news))
+    app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("digest_week", cmd_digest_week))
 
     print("Polling started...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_buttons))
+
     app.run_polling(close_loop=False)
 
 
