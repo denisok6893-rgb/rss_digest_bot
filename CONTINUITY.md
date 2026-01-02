@@ -64,6 +64,13 @@ Telegram-бот для работы с RSS-лентами.
 Реализован handle_menu_buttons:
 - кнопки вызывают существующие команды
 - без изменения update.message.text (исправлен AttributeError)
+### Авто-sync по расписанию
+
+- Настроен авто-sync через systemd timer  
+  Сервис: `rss_digest_bot_sync.service`  
+  Таймер: `rss_digest_bot_sync.timer` (каждые 30 минут)
+
+- Добавлен CLI-режим синхронизации:
 
 ---
 
@@ -128,6 +135,15 @@ Telegram-бот для работы с RSS-лентами.
 - авто-sync по расписанию ещё не включён (есть заготовка scheduler)
 
 ---
+
+##python -m app.main sync
+Выполняет sync и **выходит**, без запуска polling
+
+- Устранён конфликт Telegram:
+
+##Conflict: terminated by other getUpdates request
+Причина была в запуске второго polling-процесса таймером  
+Решение: таймер использует CLI-sync, polling запускается только основным сервисом
 
 ## Следующий шаг (один)
 Сделать авто-sync по расписанию:
