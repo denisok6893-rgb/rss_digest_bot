@@ -119,6 +119,42 @@ Telegram-бот для работы с RSS-лентами.
 
 ---
 
+### Логирование авто-sync (CLI sync)
+
+- Добавлено логирование CLI-синхронизации в файл:
+  - /opt/rss_digest_bot/logs/sync.log
+- Формат строк:
+  - [YYYY-MM-DD HH:MM:SS] start users=<N> feeds=<N>
+  - [YYYY-MM-DD HH:MM:SS] done new_entries=<N> errors=<N> duration_sec=<S>
+- Проверка:
+  - /opt/rss_digest_bot/.venv/bin/python -m app.main sync
+  - tail -n 20 /opt/rss_digest_bot/logs/sync.log
+
+### Ротация логов auto-sync
+
+- Настроена ротация логов через `logrotate`
+- Конфигурация:
+  - файл: `/etc/logrotate.d/rss_digest_bot`
+  - лог: `/opt/rss_digest_bot/logs/sync.log`
+- Параметры:
+  - ротация: ежедневно
+  - хранение: 14 дней
+  - сжатие старых логов (`compress`, `delaycompress`)
+  - безопасная обрезка активного файла (`copytruncate`)
+- Проверка:
+  - `logrotate -f /etc/logrotate.d/rss_digest_bot`
+  - `ls -l /opt/rss_digest_bot/logs`
+
+### Авто-alert через systemd (ошибки sync)
+
+- CLI-sync теперь завершает процесс с кодом != 0 при наличии ошибок (failed > 0)
+- Это позволяет systemd помечать запуск rss_digest_bot_sync.service как FAILED
+- Исправлено: UnboundLocalError для переменной failed (инициализация счётчиков в начале run_sync_cli)
+- Проверка:
+  - /opt/rss_digest_bot/.venv/bin/python -m app.main sync
+  - echo $?
+  - journalctl -u rss_digest_bot_sync.service -n 80 --no-pager
+
 ## Текущее состояние
 - бот работает
 - кнопки отображаются и обрабатываются
