@@ -212,6 +212,32 @@ async def get_week_news(user_id: int, limit: int = 20):
         )
         return await cur.fetchall()
 
+async def search_news(user_id: int, days: int, query: str, limit: int = 10):
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+
+    like = f"%{q}%"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT title, link, summary, published_at
+            FROM entries
+            WHERE user_id = ?
+              AND published_at != ''
+              AND date(published_at) >= date('now', ?)
+              AND (
+                lower(title) LIKE ?
+                OR lower(summary) LIKE ?
+                OR lower(categories) LIKE ?
+              )
+            ORDER BY published_at DESC
+            LIMIT ?
+            """,
+            (user_id, f"-{days} days", like, like, like, limit),
+        )
+        return await cur.fetchall()
+
 async def delete_subscription(user_id: int, sub_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -306,19 +332,35 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    period = (context.args[0].lower() if context.args else "today")
 
-    if period in ("week", "7", "7d"):
-        rows = await get_week_news(user_id, limit=5)
+    args = [a.strip().lower() for a in (context.args or []) if a.strip()]
+    period = "today"
+    query = ""
 
+    if args:
+        if args[0] in ("week", "7", "7d"):
+            period = "week"
+            query = " ".join(args[1:]).strip()
+        else:
+            query = " ".join(args).strip()
+
+    if period == "week":
+        if query:
+            rows = await search_news(user_id, days=6, query=query, limit=5)
+            header = f"Новости за неделю по запросу: {query}"
+        else:
+            rows = await get_week_news(user_id, limit=5)
+            header = "Новости за неделю:"
     else:
-        rows = await get_today_news(user_id, limit=10)
-
-    if not rows:
-        await update.message.reply_text("За сегодня новостей нет.")
-        return
+        if query:
+            rows = await search_news(user_id, days=0, query=query, limit=10)
+            header = f"Новости за сегодня по запросу: {query}"
+        else:
+            rows = await get_today_news(user_id, limit=10)
+            header = "Новости за сегодня:"
 
     messages = []
+    messages.append(header)
     for title, link, summary, published_at in rows:
         clean = clean_html(summary or "")
         short = (clean[:120] + "…") if clean else ""
