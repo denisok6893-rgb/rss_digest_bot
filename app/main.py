@@ -238,6 +238,38 @@ async def search_news(user_id: int, days: int, query: str, limit: int = 10):
         )
         return await cur.fetchall()
 
+async def search_news_advanced(user_id: int, days: int, query: str, category: str, limit: int = 10):
+    q = (query or "").strip().lower()
+    cat = (category or "").strip().lower()
+
+    like_q = f"%{q}%" if q else "%"
+    like_cat = f"%{cat}%" if cat else "%"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT title, link, summary, published_at
+            FROM entries
+            WHERE user_id = ?
+              AND published_at != ''
+              AND date(published_at) >= date('now', ?)
+              AND lower(categories) LIKE ?
+              AND (
+                ? = '' OR lower(title) LIKE ? OR lower(summary) LIKE ? OR lower(categories) LIKE ?
+              )
+            ORDER BY published_at DESC
+            LIMIT ?
+            """,
+            (
+                user_id,
+                f"-{days} days",
+                like_cat,
+                q, like_q, like_q, like_q,
+                limit,
+            ),
+        )
+        return await cur.fetchall()
+
 async def delete_subscription(user_id: int, sub_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -334,6 +366,15 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
 
     args = [a.strip().lower() for a in (context.args or []) if a.strip()]
+    category = ""
+    # вытаскиваем cat:...
+    args2 = []
+    for a in args:
+        if a.startswith("cat:") and len(a) > 4:
+            category = a[4:].strip()
+        else:
+            args2.append(a)
+    args = args2
     period = "today"
     query = ""
 
@@ -346,11 +387,16 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if period == "week":
         if query:
-            rows = await search_news(user_id, days=6, query=query, limit=5)
+            rows = await search_news_advanced(user_id, days=6, query=query, category=category, limit=5)
             header = f"Новости за неделю по запросу: {query}"
         else:
-            rows = await get_week_news(user_id, limit=5)
+            rows = await search_news_advanced(user_id, days=6, query=query, category=category, limit=5)
             header = "Новости за неделю:"
+            if category:
+                header += f" категория: {category}"
+            if query:
+                header += f" запрос: {query}"
+
     else:
         if query:
             rows = await search_news(user_id, days=0, query=query, limit=10)
@@ -358,6 +404,10 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             rows = await get_today_news(user_id, limit=10)
             header = "Новости за сегодня:"
+            if category:
+                header += f" категория: {category}"
+            if query:
+                header += f" запрос: {query}"
 
     messages = []
     messages.append(header)
