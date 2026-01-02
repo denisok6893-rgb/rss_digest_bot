@@ -232,7 +232,7 @@ async def get_today_news(user_id: int, limit: int = 10):
             SELECT title, link, summary, published_at
             FROM entries
             WHERE user_id = ?
-              AND date(published_at) = date('now')
+              AND date(published_at, 'localtime') = date('now', 'localtime')
             ORDER BY published_at DESC
             LIMIT ?
             """,
@@ -286,32 +286,40 @@ async def search_news_advanced(user_id: int, days: int, query: str, category: st
     q = (query or "").strip().lower()
     cat = (category or "").strip().lower()
 
-    like_q = f"%{q}%" if q else "%"
-    like_cat = f"%{cat}%" if cat else "%"
+    # days=6 => последние 7 дней (включая сегодня)
+    modifier = f"-{max(int(days), 0)} days"
+
+    where = [
+        "user_id = ?",
+        "published_at IS NOT NULL",
+        "published_at != ''",
+        "date(published_at) >= date('now', ?)",
+    ]
+    params = [user_id, modifier]
+
+    if q:
+        where.append("(lower(title) LIKE ? OR lower(summary) LIKE ?)")
+        like = f"%{q}%"
+        params.extend([like, like])
+
+    if cat:
+        # categories хранится JSON-строкой, поэтому простой LIKE
+        where.append("lower(categories) LIKE ?")
+        params.append(f"%{cat}%")
+
+    where_sql = " AND ".join(where)
+
+    sql = f"""
+        SELECT title, link, summary, published_at
+        FROM entries
+        WHERE {where_sql}
+        ORDER BY published_at DESC
+        LIMIT ?
+    """
+    params.append(limit)
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT title, link, summary, published_at
-            FROM entries
-            WHERE user_id = ?
-              AND published_at != ''
-              AND date(published_at) >= date('now', ?)
-              AND lower(categories) LIKE ?
-              AND (
-                ? = '' OR lower(title) LIKE ? OR lower(summary) LIKE ? OR lower(categories) LIKE ?
-              )
-            ORDER BY published_at DESC
-            LIMIT ?
-            """,
-            (
-                user_id,
-                f"-{days} days",
-                like_cat,
-                q, like_q, like_q, like_q,
-                limit,
-            ),
-        )
+        cur = await db.execute(sql, tuple(params))
         return await cur.fetchall()
 
 async def delete_subscription(user_id: int, sub_id: int) -> bool:
@@ -375,7 +383,6 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sub_id = int(context.args[0])
     ok = await delete_subscription(user_id, sub_id)
     await update.message.reply_text("Удалено." if ok else "Не найдено. Проверь ID в /list.")
-
 
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -449,17 +456,12 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             query = " ".join(args).strip()
 
     if period == "week":
+        rows = await get_week_news(user_id, limit=15)
+        header = "Новости за неделю:"
+        if category:
+            header += f" категория: {category}"
         if query:
-            rows = await search_news_advanced(user_id, days=6, query=query, category=category, limit=5)
-            header = f"Новости за неделю по запросу: {query}"
-        else:
-            rows = await search_news_advanced(user_id, days=6, query=query, category=category, limit=5)
-            header = "Новости за неделю:"
-            if category:
-                header += f" категория: {category}"
-            if query:
-                header += f" запрос: {query}"
-
+            header += f" запрос: {query}"
     else:
         if query:
             rows = await search_news(user_id, days=0, query=query, limit=10)
@@ -491,19 +493,10 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text in ("📰 Сегодня", "Сегодня"):
         # авто-sync
         context.args = []
-        await cmd_sync(update, context)
-
-        # новости за сегодня
-        context.args = []
         await cmd_news(update, context)
         return
 
     if text in ("📅 Неделя", "Неделя"):
-        # авто-sync
-        context.args = []
-        await cmd_sync(update, context)
-
-        # новости за неделю
         context.args = ["week"]
         await cmd_news(update, context)
         return
