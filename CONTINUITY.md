@@ -65,6 +65,10 @@ Telegram-бот для работы с RSS-лентами.
 - кнопки вызывают существующие команды
 - без изменения update.message.text (исправлен AttributeError)
 - Авто-sync включён и проверен: timer active, service SUCCESS, лог sync.log пишется.
+- Добавлена защита от “битых” RSS: в subscriptions поля fail_count, disabled, last_error.
+- CLI-sync пропускает disabled=1, увеличивает fail_count при ошибках, сбрасывает при успехе.
+- При fail_count >= SYNC_MAX_FAILS (по умолчанию 5) подписка авто-отключается и отправляется Telegram-уведомление.
+- Ошибки sync возвращают exit-code=1 для systemd (алерты/FAILED).
 
 ### Авто-sync по расписанию
 
