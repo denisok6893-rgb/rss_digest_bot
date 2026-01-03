@@ -64,6 +64,8 @@ Telegram-бот для работы с RSS-лентами.
 Реализован handle_menu_buttons:
 - кнопки вызывают существующие команды
 - без изменения update.message.text (исправлен AttributeError)
+- Авто-sync включён и проверен: timer active, service SUCCESS, лог sync.log пишется.
+
 ### Авто-sync по расписанию
 
 - Настроен авто-sync через systemd timer  
@@ -154,6 +156,9 @@ Telegram-бот для работы с RSS-лентами.
   - /opt/rss_digest_bot/.venv/bin/python -m app.main sync
   - echo $?
   - journalctl -u rss_digest_bot_sync.service -n 80 --no-pager
+- Исправлено: run_sync_cli() теперь завершает процесс с кодом 1, если errors > 0 (после выполнения цикла sync).
+- Проверка: добавляли тестовую подписку на http://127.0.0.1:9/bad.xml → Sync done... Errors: 1, exit-code: 1, запись в logs/sync.log с errors=1.
+- Эффект: systemd помечает rss_digest_bot_sync.service как FAILED при ошибках синхронизации, таймер остаётся включён.
 
 ## Текущее состояние
 - бот работает
@@ -161,6 +166,7 @@ Telegram-бот для работы с RSS-лентами.
 - новости приходят корректно
 - “Сегодня” и “Неделя” отличаются
 - сервис запускается через systemd без ModuleNotFoundError
+- Авто-sync + авто-alert работают: таймер активен, при ошибках sync сервис получает non-zero exit code.
 
 ---
 
