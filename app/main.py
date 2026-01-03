@@ -485,8 +485,24 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         short = (clean[:120] + "…") if clean else ""
         messages.append(f"📰 {title}\n{short}\n🔗 {link}")
 
-    text = "\n\n".join(messages)
-    await update.message.reply_text(text)
+        text = "\n\n".join(messages)
+
+        # Telegram limit ~4096. Отправляем частями.
+        MAX_LEN = 3900
+        if len(text) <= MAX_LEN:
+            await update.message.reply_text(text)
+        else:
+            chunk = ""
+            for part in text.split("\n\n"):
+                # +2 за разделитель
+                if len(chunk) + len(part) + 2 > MAX_LEN:
+                    if chunk:
+                        await update.message.reply_text(chunk)
+                    chunk = part
+                else:
+                    chunk = part if not chunk else (chunk + "\n\n" + part)
+            if chunk:
+                await update.message.reply_text(chunk)
 
 async def post_init(app: Application) -> None:
     await init_db()
