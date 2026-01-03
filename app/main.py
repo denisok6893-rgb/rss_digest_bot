@@ -546,10 +546,6 @@ async def run_sync_cli() -> None:
     subs = await list_all_subscriptions()
     users_count = len({u for (u, _sid, _url, _t) in subs})
     log_line(f"start users={users_count} feeds={len(subs)}")
-    # если были ошибки — сигналим systemd, что запуск проблемный
-    if failed > 0:
-        print(f"Sync finished with errors: {failed}")
-        raise SystemExit(1)
 
     if not subs:
         print("No subscriptions to sync.")
@@ -576,6 +572,7 @@ async def run_sync_cli() -> None:
     duration = time.time() - start_ts
     log_line(f"done new_entries={total_added} errors={failed} duration_sec={duration:.2f}")
     print(f"Sync done. New entries: {total_added}. Errors: {failed}.")
+    raise SystemExit(1 if failed > 0 else 0)
 
 def main() -> None:
     token = os.getenv("BOT_TOKEN", "").strip()
