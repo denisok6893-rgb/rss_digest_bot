@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from typing import Tuple
 from telegram.request import HTTPXRequest
 from openai import AsyncOpenAI
+import calendar
+from datetime import timezone
 
 import aiosqlite
 import feedparser
@@ -166,36 +168,109 @@ async def make_digest(items: list[tuple[str, str, str]], period_label: str) -> s
     )
     return (resp.choices[0].message.content or "").strip()
 
-async def save_entries(user_id: int, subscription_id: int, feed_url: str, parsed) -> int:
+def normalize_published_at(entry) -> str:
+    """
+    Приводим дату публикации к ISO-8601, чтобы SQLite date()/datetime() корректно работали.
+    Возвращаем строку вида: 2026-01-03T15:16:11+00:00
+    """
+    # 1) feedparser часто даёт struct_time в published_parsed/updated_parsed
+    st = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if st:
+        dt = datetime.fromtimestamp(calendar.timegm(st), tz=timezone.utc)
+        return dt.isoformat(timespec="seconds")
+
+    # 2) иногда есть строка published/updated (RFC822 или ISO)
+    s = getattr(entry, "published", None) or getattr(entry, "updated", None)
+    if s:
+        # 2a) RFC822 (например arXiv)
+        try:
+            dt = parsedate_to_datetime(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.isoformat(timespec="seconds")
+        except Exception:
+            pass
+
+        # 2b) ISO-8601 (например Habr) — оставим как есть, если парсится
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.isoformat(timespec="seconds")
+        except Exception:
+            pass
+
+    # 3) если даты нет/не распарсилась — пишем текущую (лучше чем пусто)
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+async def save_entries(user_id: int, sub_id: int, url: str, parsed) -> int:
     added = 0
+
+    entries = getattr(parsed, "entries", None) or []
+    if not entries:
+        return 0
+
     async with aiosqlite.connect(DB_PATH) as db:
-        for e in parsed.entries[:200]:
-            title = _to_text(getattr(e, "title", ""))
-            link = _to_text(getattr(e, "link", ""))
-            if not title or not link:
+        for entry in entries:
+            try:
+                title = str(getattr(entry, "title", "") or "").strip()
+                link = str(getattr(entry, "link", "") or "").strip()
+                summary = str(getattr(entry, "summary", "") or "").strip()
+
+                try:
+                    published_at = normalize_published_at(entry) or ""
+                except Exception:
+                    published_at = ""
+
+                categories = []
+                for t in (getattr(entry, "tags", None) or []):
+                    if isinstance(t, dict):
+                        term = (t.get("term") or "").strip()
+                        if term:
+                            categories.append(term)
+
+                guid = str(
+                    getattr(entry, "id", "")
+                    or getattr(entry, "guid", "")
+                    or ""
+                ).strip()
+
+                base = (guid or link or title or "") + "|" + published_at
+                h = hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+                cur = await db.execute(
+                    """
+                    INSERT OR IGNORE INTO entries
+                    (user_id, subscription_id, guid, title, link, summary, published_at, categories, hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(user_id),
+                        int(sub_id),
+                        guid,
+                        title or "(no title)",
+                        link or url,
+                        summary,
+                        published_at,
+                        json.dumps(categories, ensure_ascii=False),
+                        h,
+                    ),
+                )
+
+                if cur.rowcount > 0:
+                    added += 1
+
+            except Exception:
+                # битая запись — пропускаем, sync не ломаем
                 continue
 
-            guid = _to_text(getattr(e, "id", "")) or _to_text(getattr(e, "guid", ""))
-            summary = _to_text(getattr(e, "summary", "")) or _to_text(getattr(e, "description", ""))
-            published_at = _published_iso(e)
-            categories = _categories_json(e)
-            h = _entry_hash(feed_url, guid, link, title)
-
-            try:
-                await db.execute(
-                    """
-                    INSERT INTO entries(user_id, subscription_id, guid, title, link, summary, published_at, categories, hash)
-                    VALUES(?,?,?,?,?,?,?,?,?)
-                    """,
-                    (user_id, subscription_id, guid, title, link, summary, published_at, categories, h),
-                )
-                added += 1
-            except aiosqlite.IntegrityError:
-                pass
-
         await db.commit()
-    return added
 
+    return added
 
 async def add_subscription(user_id: int, url: str, title: str) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -236,24 +311,23 @@ async def get_today_news(user_id: int, limit: int = 10):
             SELECT title, link, summary, published_at
             FROM entries
             WHERE user_id = ?
-              AND date(published_at, 'localtime') = date('now', 'localtime')
-            ORDER BY published_at DESC
+              AND date(created_at, 'localtime') = date('now', 'localtime')
+            ORDER BY created_at DESC
             LIMIT ?
             """,
             (user_id, limit),
         )
         return await cur.fetchall()
 
-async def get_week_news(user_id: int, limit: int = 20):
+async def get_week_news(user_id: int, limit: int = 15):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
             SELECT title, link, summary, published_at
             FROM entries
             WHERE user_id = ?
-              AND published_at != ''
-              AND date(published_at) >= date('now', '-6 days')
-            ORDER BY published_at DESC
+              AND datetime(created_at) >= datetime('now', '-7 days')
+            ORDER BY created_at DESC
             LIMIT ?
             """,
             (user_id, limit),
@@ -487,22 +561,22 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         text = "\n\n".join(messages)
 
-        # Telegram limit ~4096. Отправляем частями.
-        MAX_LEN = 3900
+        # Telegram limit ~4096, берём запас
+        MAX_LEN = 3800
+
         if len(text) <= MAX_LEN:
             await update.message.reply_text(text)
         else:
             chunk = ""
             for part in text.split("\n\n"):
-                # +2 за разделитель
-                if len(chunk) + len(part) + 2 > MAX_LEN:
-                    if chunk:
-                        await update.message.reply_text(chunk)
-                    chunk = part
+                part2 = part + "\n\n"
+                if len(chunk) + len(part2) > MAX_LEN:
+                    await update.message.reply_text(chunk.strip())
+                    chunk = part2
                 else:
-                    chunk = part if not chunk else (chunk + "\n\n" + part)
-            if chunk:
-                await update.message.reply_text(chunk)
+                    chunk += part2
+            if chunk.strip():
+                await update.message.reply_text(chunk.strip())
 
 async def post_init(app: Application) -> None:
     await init_db()
@@ -597,6 +671,22 @@ async def run_sync_cli() -> None:
             await db.commit()
             return int(row[0]) if row else 0
 
+    async def get_top_failures(limit: int = 5) -> list[tuple[int, str, int, str | None]]:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT id, url, fail_count, last_error "
+                "FROM subscriptions "
+                "WHERE disabled=0 AND fail_count>0 "
+                "ORDER BY fail_count DESC, id DESC "
+                "LIMIT ?",
+                (limit,),
+            )
+            rows = await cur.fetchall()
+            out: list[tuple[int, str, int, str | None]] = []
+            for r in rows:
+                out.append((int(r[0]), str(r[1]), int(r[2]), (str(r[3]) if r[3] is not None else None)))
+            return out
+
     async def disable_subscription(sub_id: int) -> None:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE subscriptions SET disabled=1 WHERE id=?", (sub_id,))
@@ -637,9 +727,6 @@ async def run_sync_cli() -> None:
                     new_fc = await mark_failure(sub_id, "invalid feed content")
                     if new_fc >= max_fail:
                         await disable_subscription(sub_id)
-                        await send_telegram_alert(
-                            f"rss_digest_bot: disabled subscription id={sub_id} after {new_fc} fails: {url}"
-                        )
                     continue
 
                 added = await save_entries(user_id, sub_id, url, parsed)
@@ -658,10 +745,52 @@ async def run_sync_cli() -> None:
     duration = time.time() - start_ts
     log_line(f"done new_entries={total_added} errors={failed} duration_sec={duration:.2f}")
     print(f"Sync done. New entries: {total_added}. Errors: {failed}.")
-    if failed > 0:
-        await send_telegram_alert(
-            f"rss_digest_bot: sync errors={failed}, new_entries={total_added} (host={os.uname().nodename})"
-        )
+    # Дедуп алертов: шлём только при смене состояния ошибок
+    state_file = log_dir / "sync_alert_state.json"
+    now_ts = int(time.time())
+    prev = {"had_errors": None, "last_sent_ts": 0}
+
+    try:
+        if state_file.exists():
+            prev = json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:
+        prev = {"had_errors": None, "last_sent_ts": 0}
+
+    had_errors = failed > 0
+    prev_had = prev.get("had_errors", None)
+    last_sent = int(prev.get("last_sent_ts", 0) or 0)
+
+    # Шлём если изменилось состояние (0->1 или 1->0) или если давно не слали (раз в 6 часов)
+    force_interval_sec = 6 * 3600
+    should_send = (prev_had is None) or (had_errors != prev_had) or (now_ts - last_sent >= force_interval_sec)
+
+    if should_send:
+        if had_errors:
+            top = await get_top_failures(5)
+            lines = [
+                f"rss_digest_bot: sync errors={failed}, new_entries={total_added} (host={os.uname().nodename})"
+            ]
+            if top:
+                lines.append("Top failed feeds:")
+                for sid, url, fc, err in top:
+                    e = (err or "—")
+                    if len(e) > 160:
+                        e = e[:160] + "…"
+                    lines.append(f"- id={sid} fails={fc}\n  {url}\n  err={e}")
+            await send_telegram_alert("\n".join(lines))
+
+        else:
+            await send_telegram_alert(
+                f"rss_digest_bot: sync OK, new_entries={total_added} (host={os.uname().nodename})"
+            )
+
+        try:
+            state_file.write_text(
+                json.dumps({"had_errors": had_errors, "last_sent_ts": now_ts}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     raise SystemExit(1 if failed > 0 else 0)
 
