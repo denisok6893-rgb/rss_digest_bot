@@ -519,17 +519,21 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Настройки появятся позже.")
         return
 
-async def list_all_subscriptions() -> list[tuple[int, int, str, str]]:
+async def list_all_subscriptions() -> list[tuple[int, int, str, str, int, int]]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT user_id, id, url, title FROM subscriptions ORDER BY user_id, id"
+            "SELECT user_id, id, url, title, disabled, fail_count "
+            "FROM subscriptions ORDER BY user_id, id"
         )
         rows = await cur.fetchall()
-        return [(int(r[0]), int(r[1]), str(r[2]), str(r[3])) for r in rows]
-
+        return [
+            (int(r[0]), int(r[1]), str(r[2]), str(r[3]), int(r[4]), int(r[5]))
+            for r in rows
+        ]
 
 async def run_sync_cli() -> None:
     start_ts = time.time()
+    load_dotenv("/opt/rss_digest_bot/.env")
     log_dir = Path("/opt/rss_digest_bot/logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "sync.log"
@@ -539,12 +543,53 @@ async def run_sync_cli() -> None:
         with log_file.open("a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
 
+    async def send_telegram_alert(text: str) -> None:
+        token = (os.getenv("SYNC_ALERT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+        chat_id = (os.getenv("SYNC_ALERT_CHAT_ID") or "").strip()
+        if not token or not chat_id:
+            return  # не настроено — пропускаем
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as c:
+                await c.post(url, json=payload)
+        except Exception:
+            return  # алерт не должен ломать sync
+
     # гарантируем, что БД/таблицы есть
     await init_db()
+    
+    async def mark_success(sub_id: int) -> None:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE subscriptions SET fail_count=0, last_error=NULL WHERE id=?",
+                (sub_id,),
+            )
+            await db.commit()
+
+    async def mark_failure(sub_id: int, err: str) -> int:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "UPDATE subscriptions "
+                "SET fail_count=fail_count+1, last_error=? "
+                "WHERE id=? "
+                "RETURNING fail_count",
+                (err[:500], sub_id),
+            )
+            row = await cur.fetchone()
+            await db.commit()
+            return int(row[0]) if row else 0
+
+    async def disable_subscription(sub_id: int) -> None:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE subscriptions SET disabled=1 WHERE id=?", (sub_id,))
+            await db.commit()
+   
     total_added = 0
     failed = 0
     subs = await list_all_subscriptions()
-    users_count = len({u for (u, _sid, _url, _t) in subs})
+    users_count = len({row[0] for row in subs})
     log_line(f"start users={users_count} feeds={len(subs)}")
 
     if not subs:
@@ -556,22 +601,52 @@ async def run_sync_cli() -> None:
     total_added = 0
     failed = 0
 
+    max_fail = int(os.getenv("SYNC_MAX_FAILS", "5"))
+
+    max_fail = int(os.getenv("SYNC_MAX_FAILS", "5"))
+
     timeout = httpx.Timeout(20.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        for user_id, sub_id, url, _title in subs:
+        for user_id, sub_id, url, _title, disabled, fail_count in subs:
+            if disabled == 1:
+                continue
+
             try:
                 r = await client.get(url, headers={"User-Agent": "rss-digest-bot/0.1"})
                 r.raise_for_status()
                 parsed = feedparser.parse(r.content)
+
                 if not getattr(parsed, "feed", None) or parsed.entries is None:
                     failed += 1
+                    new_fc = await mark_failure(sub_id, "invalid feed content")
+                    if new_fc >= max_fail:
+                        await disable_subscription(sub_id)
+                        await send_telegram_alert(
+                            f"rss_digest_bot: disabled subscription id={sub_id} after {new_fc} fails: {url}"
+                        )
                     continue
-                total_added += await save_entries(user_id, sub_id, url, parsed)
-            except Exception:
+
+                added = await save_entries(user_id, sub_id, url, parsed)
+                total_added += added
+                await mark_success(sub_id)
+
+            except Exception as e:
                 failed += 1
+                new_fc = await mark_failure(sub_id, repr(e))
+                if new_fc >= max_fail:
+                    await disable_subscription(sub_id)
+                    await send_telegram_alert(
+                        f"rss_digest_bot: disabled subscription id={sub_id} after {new_fc} fails: {url}"
+                    )
+
     duration = time.time() - start_ts
     log_line(f"done new_entries={total_added} errors={failed} duration_sec={duration:.2f}")
     print(f"Sync done. New entries: {total_added}. Errors: {failed}.")
+    if failed > 0:
+        await send_telegram_alert(
+            f"rss_digest_bot: sync errors={failed}, new_entries={total_added} (host={os.uname().nodename})"
+        )
+
     raise SystemExit(1 if failed > 0 else 0)
 
 def main() -> None:
