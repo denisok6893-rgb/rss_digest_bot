@@ -6,7 +6,7 @@ import os
 import re
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Tuple
 from telegram.request import HTTPXRequest
 from openai import AsyncOpenAI
@@ -21,6 +21,8 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from app.keyboards.main_menu import main_menu_keyboard
+from app.keyboards.settings_menu import settings_menu_keyboard
+from telegram import Update, Bot
 
 load_dotenv()
 
@@ -65,6 +67,33 @@ async def init_db() -> None:
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_entries_user_date ON entries(user_id, published_at);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_entries_user_sub_date ON entries(user_id, subscription_id, published_at);")
+        # user settings for auto-digest
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                digest_enabled INTEGER NOT NULL DEFAULT 0,
+                digest_interval_min INTEGER NOT NULL DEFAULT 120,
+                next_digest_at TEXT,
+                last_digest_at TEXT
+            );
+            """
+        )
+
+        # ensure columns in subscriptions (for new installs)
+        try:
+            await db.execute("ALTER TABLE subscriptions ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE subscriptions ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE subscriptions ADD COLUMN last_error TEXT;")
+        except Exception:
+            pass
+
         await db.commit()
 
 
@@ -167,6 +196,27 @@ async def make_digest(items: list[tuple[str, str, str]], period_label: str) -> s
         max_tokens=800,
     )
     return (resp.choices[0].message.content or "").strip()
+
+async def make_digest_safe(items: list[tuple[str, str, str]], period_label: str) -> str:
+    """
+    Пытаемся сделать ИИ-сводку. Если API недоступно/баланс=0/ошибка — шлём простой дайджест без ИИ.
+    items: (title, summary, link)
+    """
+    try:
+        return await make_digest(items, period_label=period_label)
+    except Exception as e:
+        # fallback: простой список
+        header = f"Новости за {period_label} (без ИИ-сводки: {type(e).__name__})"
+        lines = [header, ""]
+        for i, (title, summary, link) in enumerate(items, 1):
+            s = clean_html(summary or "")
+            s = (s[:200] + "…") if len(s) > 200 else s
+            lines.append(f"{i}. {title}")
+            if s:
+                lines.append(s)
+            lines.append(link)
+            lines.append("")
+        return "\n".join(lines).strip()
 
 def normalize_published_at(entry) -> str:
     """
@@ -304,6 +354,49 @@ async def get_subscriptions(user_id: int) -> list[tuple[int, str, str]]:
         rows = await cur.fetchall()
         return [(int(r[0]), str(r[1]), str(r[2])) for r in rows]
 
+async def get_user_settings(user_id: int) -> tuple[int, int, str | None, str | None]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT digest_enabled, digest_interval_min, next_digest_at, last_digest_at FROM user_settings WHERE user_id=?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            await db.execute(
+                "INSERT INTO user_settings(user_id, digest_enabled, digest_interval_min) VALUES (?, 0, 120)",
+                (user_id,),
+            )
+            await db.commit()
+            return 0, 120, None, None
+        return int(row[0]), int(row[1]), row[2], row[3]
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _add_minutes_iso(dt_iso: str, minutes: int) -> str:
+    dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
+    return (dt + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+
+async def set_digest_settings(user_id: int, enabled: int, interval_min: int) -> None:
+    now = _now_utc_iso()
+    next_at = _add_minutes_iso(now, interval_min) if enabled else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO user_settings(user_id, digest_enabled, digest_interval_min, next_digest_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              digest_enabled=excluded.digest_enabled,
+              digest_interval_min=excluded.digest_interval_min,
+              next_digest_at=excluded.next_digest_at
+            """,
+            (user_id, int(enabled), int(interval_min), next_at),
+        )
+        await db.commit()
+
 async def get_today_news(user_id: int, limit: int = 10):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -331,6 +424,21 @@ async def get_week_news(user_id: int, limit: int = 15):
             LIMIT ?
             """,
             (user_id, limit),
+        )
+        return await cur.fetchall()
+
+async def get_last_hours_news(user_id: int, hours: int = 24, limit: int = 10):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT title, link, summary, published_at
+            FROM entries
+            WHERE user_id = ?
+              AND datetime(created_at) >= datetime('now', ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, f"-{int(hours)} hours", limit),
         )
         return await cur.fetchall()
 
@@ -496,7 +604,7 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     items = [(r[0], r[2], r[1]) for r in rows]  # title, summary, link
-    text = await make_digest(items, period_label="сегодня")
+    text = await make_digest_safe(items, period_label="сегодня")
     await update.message.reply_text(text[:4000])
 
 async def cmd_digest_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -606,7 +714,37 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if text in ("⚙️ Настройки", "Настройки"):
-        await update.message.reply_text("Настройки появятся позже.")
+        user_id = update.effective_user.id
+        enabled, interval_min, next_at, last_at = await get_user_settings(user_id)
+        status = "включен" if enabled else "выключен"
+        await update.message.reply_text(
+            f"⚙️ Настройки\n\nАвто-дайджест: {status}\nИнтервал: {interval_min} мин\nСледующая отправка: {next_at or '—'}",
+            reply_markup=settings_menu_keyboard(),
+        )
+        return
+
+    if text == "⏱ Авто-дайджест: 1 час":
+        await set_digest_settings(update.effective_user.id, 1, 60)
+        await update.message.reply_text("Ок: авто-дайджест каждые 1 час.", reply_markup=main_menu_keyboard())
+        return
+
+    if text == "⏱ Авто-дайджест: 2 часа":
+        await set_digest_settings(update.effective_user.id, 1, 120)
+        await update.message.reply_text("Ок: авто-дайджест каждые 2 часа.", reply_markup=main_menu_keyboard())
+        return
+
+    if text == "⏱ Авто-дайджест: 4 часа":
+        await set_digest_settings(update.effective_user.id, 1, 240)
+        await update.message.reply_text("Ок: авто-дайджест каждые 4 часа.", reply_markup=main_menu_keyboard())
+        return
+
+    if text == "⛔️ Авто-дайджест: выключить":
+        await set_digest_settings(update.effective_user.id, 0, 120)
+        await update.message.reply_text("Ок: авто-дайджест выключен.", reply_markup=main_menu_keyboard())
+        return
+
+    if text == "⬅️ Назад":
+        await update.message.reply_text("Главное меню.", reply_markup=main_menu_keyboard())
         return
 
 async def list_all_subscriptions() -> list[tuple[int, int, str, str, int, int]]:
@@ -794,6 +932,101 @@ async def run_sync_cli() -> None:
 
     raise SystemExit(1 if failed > 0 else 0)
 
+async def send_long_message(bot: Bot, chat_id: int, text: str, max_len: int = 3800) -> None:
+    """
+    Отправляет длинный текст частями, стараясь резать по абзацам.
+    Если один абзац слишком длинный — режет по символам.
+    """
+    if not text:
+        return
+
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunk = ""
+
+    async def _flush(c: str) -> None:
+        c = c.strip()
+        if not c:
+            return
+        await bot.send_message(chat_id=chat_id, text=c, disable_web_page_preview=True)
+        await asyncio.sleep(0.2)  # небольшой анти-флуд
+
+    for p in parts:
+        candidate = (chunk + "\n\n" + p).strip() if chunk else p
+
+        if len(candidate) <= max_len:
+            chunk = candidate
+            continue
+
+        # если текущий chunk уже есть — отправляем его
+        if chunk:
+            await _flush(chunk)
+            chunk = ""
+
+        # если абзац сам по себе длиннее лимита — режем его по кускам
+        if len(p) > max_len:
+            start = 0
+            while start < len(p):
+                await _flush(p[start:start + max_len])
+                start += max_len
+        else:
+            chunk = p
+
+    if chunk:
+        await _flush(chunk)
+
+async def run_digest_tick_cli() -> None:
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("Не задан BOT_TOKEN в .env")
+
+    await init_db()
+
+    now_iso = _now_utc_iso()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT user_id, digest_interval_min, next_digest_at, last_digest_at
+            FROM user_settings
+            WHERE digest_enabled=1
+              AND (next_digest_at IS NULL OR datetime(next_digest_at) <= datetime('now'))
+            """
+        )
+        users = await cur.fetchall()
+
+    if not users:
+        return
+
+    bot = Bot(token=token)
+
+    for (user_id, interval_min, next_at, last_at) in users:
+        user_id = int(user_id)
+        interval_min = int(interval_min)
+
+        rows = await get_last_hours_news(user_id, hours=24, limit=10)
+        if not rows:
+            # всё равно двигаем next_digest_at, чтобы не спамить пустыми
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE user_settings SET next_digest_at=?, last_digest_at=COALESCE(last_digest_at, ?) WHERE user_id=?",
+                    (_add_minutes_iso(now_iso, interval_min), now_iso, user_id),
+                )
+                await db.commit()
+            continue
+
+        items = [(r[0], r[2], r[1]) for r in rows]
+        text = await make_digest_safe(items, period_label="сегодня")
+
+        # Telegram лимит
+        await send_long_message(bot, user_id, text, max_len=3800)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE user_settings SET last_digest_at=?, next_digest_at=? WHERE user_id=?",
+                (now_iso, _add_minutes_iso(now_iso, interval_min), user_id),
+            )
+            await db.commit()
+
 def main() -> None:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -819,5 +1052,7 @@ def main() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "sync":
         asyncio.run(run_sync_cli())
+    elif len(sys.argv) > 1 and sys.argv[1] == "digest_tick":
+        asyncio.run(run_digest_tick_cli())
     else:
         main()
