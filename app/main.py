@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import ReplyKeyboardMarkup
 from app.keyboards.main_menu import main_menu_keyboard
 from app.keyboards.settings_menu import settings_menu_keyboard
 from telegram import Update, Bot
@@ -28,6 +29,23 @@ load_dotenv()
 
 DB_PATH = "data/rss.db"
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+CATEGORY_PRESETS = {
+    "AI": [
+        ("RB.RU (AI)", "https://rb.ru/rss/"),
+        ("Google DeepMind Blog", "https://deepmind.googleblog.com/feeds/posts/default"),
+        ("MIT Technology Review", "https://www.technologyreview.com/feed/"),
+    ],
+    "Разработка": [
+        ("Habr / Разработка", "https://habr.com/ru/rss/flows/develop/articles/?fl=ru"),
+        ("Dev.to", "https://dev.to/feed/"),
+    ],
+    "Security": [
+        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews"),
+    ],
+    "Бизнес": [
+        ("TechCrunch", "https://techcrunch.com/feed/"),
+    ],
+}
 
 
 async def init_db() -> None:
@@ -654,6 +672,14 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             header = f"Новости за сегодня по запросу: {query}"
         else:
             rows = await get_today_news(user_id, limit=10)
+            
+            if not rows:
+                await update.message.reply_text(
+                    "📰 Сегодня новых новостей нет.\n"
+                    "Попробуйте позже или нажмите «📅 Неделя»."
+                )
+                
+                return
             header = "Новости за сегодня:"
             if category:
                 header += f" категория: {category}"
@@ -745,6 +771,52 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if text == "⬅️ Назад":
         await update.message.reply_text("Главное меню.", reply_markup=main_menu_keyboard())
+        return
+
+    if text == "🗂 Категории":
+        kb = [[f"📌 {name}"] for name in CATEGORY_PRESETS.keys()]
+        kb.append(["⬅️ Назад"])
+        await update.message.reply_text(
+            "Выберите категорию. Я подключу набор RSS, лишнее можно удалить в «📃 Мои источники».",
+            reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
+        )
+        return
+
+    if text.startswith("📌 "):
+        category_name = text.replace("📌 ", "", 1).strip()
+        items = CATEGORY_PRESETS.get(category_name)
+        if not items:
+            await update.message.reply_text(
+                "Неизвестная категория.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        added = 0
+        skipped = 0
+        for title, url in items:
+            try:
+                status = await add_subscription(user_id, url, title)
+                if "✅" in status:
+                    added += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+
+        await update.message.reply_text(
+            f"Категория «{category_name}» подключена.\n"
+            f"Добавлено: {added}\n"
+            f"Пропущено (уже было/ошибка): {skipped}",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if text == "⬅️ Назад":
+        await update.message.reply_text(
+            "Главное меню.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
 async def list_all_subscriptions() -> list[tuple[int, int, str, str, int, int]]:

@@ -4,6 +4,7 @@ def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton("📰 Сегодня"), KeyboardButton("📅 Неделя")],
+            [KeyboardButton("🗂 Категории")],
             [KeyboardButton("➕ Добавить RSS"), KeyboardButton("📃 Мои источники")],
             [KeyboardButton("⚙️ Настройки")],
         ],
